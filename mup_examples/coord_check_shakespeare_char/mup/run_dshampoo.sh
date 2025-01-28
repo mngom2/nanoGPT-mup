@@ -7,8 +7,8 @@ do
     mup_base_width=256
     mup_base_head=$((mup_base_width/head_size))
     mup_width_multiplier=$(echo "scale=8; $width/$mup_base_width" | bc -l)
-    out_dir="mup_examples/coord_check_shakespeare_char/mup/out/width${width}_depth2_seed${seed}"
-    python train.py \
+    out_dir="mup_examples/coord_check_shakespeare_char/mup/out/dshampoo/width${width}_depth2_seed${seed}"
+    python train_dshampoo.py \
         --out_dir=$out_dir \
         --eval_interval=1 \
         --log_interval=1 \

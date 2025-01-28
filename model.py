@@ -14,6 +14,19 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from sophia import SophiaG
+import sys
+sys.path.append("..")
+from optimizers.distributed_shampoo.distributed_shampoo import DistributedShampoo
+from optimizers.distributed_shampoo.shampoo_types import AdamGraftingConfig
+from adopt.adopt import ADOPT
+#from intel_extension_for_pytorch.optim._lamb import Lamb #consider addig deepspeed lamb
+optimizer_dict = {'adamw': torch.optim.AdamW,
+                  'sophiag': SophiaG,
+                  'adopt': ADOPT,
+                  'sgd': torch.optim.SGD,
+                  'dshampoo': DistributedShampoo
+                 }
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -42,6 +55,7 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.dropout = config.dropout
         self.mup_enabled = config.mup_enabled
+        self.mup_base_head = config.mup_base_head
         self.mup_disable_attention_scaling = config.mup_disable_attention_scaling
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
@@ -62,7 +76,7 @@ class CausalSelfAttention(nn.Module):
 
         if self.mup_enabled and not self.mup_disable_attention_scaling:
             ### Begin muP code ###
-            attention_scale = 1.0 / k.size(-1)
+            attention_scale = 1.0 / k.size(-1) *  math.sqrt(self.mup_base_head)
             ### End muP code ###
         else:
             attention_scale = 1.0 / math.sqrt(k.size(-1))
@@ -132,7 +146,7 @@ class GPTConfig:
     mup_width_multiplier: float = 1 # `mup_width_multiplier = width / base_width` where base_width is typically 256
     mup_input_alpha: float = 1 # Optional tunable multiplier applied to input embedding forward pass output
     mup_output_alpha: float = 1 # Optional tunable multiplier applied to output unembedding forward pass output
-
+    mup_base_head: float = 1 #optional
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -295,7 +309,7 @@ class GPT(nn.Module):
 
         return model
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizers(self, optimizer_name , weight_decay, learning_rate, betas, device_type, rho):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
@@ -316,10 +330,16 @@ class GPT(nn.Module):
                 else:
                     nodecay_params.append(p)
             optim_groups = [
-                {'params': mup_decay_params, 'weight_decay': weight_decay, 'lr_scale': 1/self.config.mup_width_multiplier},
-                {'params': decay_params, 'weight_decay': weight_decay, 'lr_scale': 1},
-                {'params': nodecay_params, 'weight_decay': 0.0, 'lr_scale': 1}
-            ]
+                    {"params": mup_decay_params, "weight_decay": weight_decay, 'lr_scale':1 if (optimizer_name == 'sgd') else 1 if optimizer_name == 'dshampoo' else  1/self.config.mup_width_multiplier},
+                {'params': decay_params, 'weight_decay': weight_decay, 'lr_scale': self.config.mup_width_multiplier if (optimizer_name == 'sgd' ) else ((self.config.mup_width_multiplier)**1.5 ) if optimizer_name == 'dshampoo'  else 1},
+                    {"params": nodecay_params, "weight_decay": 0.0, 'lr_scale':self.config.mup_width_multiplier if (optimizer_name == 'sgd') else (self.config.mup_width_multiplier)**0.5 if optimizer_name == 'dshampoo' else 1}]
+
+
+         #   optim_groups = [
+         #       {'params': mup_decay_params, 'weight_decay': weight_decay, 'lr_scale': 1/self.config.mup_width_multiplier},
+         #       {'params': decay_params, 'weight_decay': weight_decay, 'lr_scale': 1},
+          #      {'params': nodecay_params, 'weight_decay': 0.0, 'lr_scale': 1}
+          #  ]
             num_mup_decay_params = sum(p.numel() for p in mup_decay_params)
             num_decay_params = sum(p.numel() for p in decay_params)
             num_nodecay_params = sum(p.numel() for p in nodecay_params)
@@ -339,13 +359,54 @@ class GPT(nn.Module):
             print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
             print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
+        #fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        #use_fused = fused_available and device_type == 'cuda'
+        #extra_args = dict(fused=True) if use_fused else dict()
+        #optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        
 
+
+        #print(f"using fused AdamW: {use_fused}")i
+        opt_func = optimizer_dict[optimizer_name]
+        if optimizer_name == 'adamw':
+        # new PyTorch nightly has a new 'fused' option for AdamW that is much faster
+            use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters)
+            print(f"using fused AdamW: {use_fused}")
+            extra_args = dict(fused=True) if use_fused else dict()
+            optimizer = opt_func(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        elif optimizer_name == 'sophiag':
+            optimizer = opt_func(optim_groups, lr=learning_rate, betas=betas, rho=rho)   
+        elif optimizer_name == 'sophiatr':
+            optimizer = opt_func(optim_groups, lr=learning_rate, betas=betas, rho=rho)
+        elif optimizer_name == 'dshampoo':
+            #config__ = AdamGraftingConfig(beta2=0.999, epsilon=1e-8)
+            #print(isinstance(config__, AdamGraftingConfig)) 
+            optimizer = opt_func(optim_groups, lr=learning_rate, betas=betas, epsilon = 1e-12, max_preconditioner_dim = 8192, precondition_frequency = 100, use_decoupled_weight_decay=True, grafting_config=AdamGraftingConfig(
+        beta2=0.999,
+        epsilon=1e-8,
+    ))
+        elif optimizer_name == 'adopt':
+        # new PyTorch nightly has a new 'fused' option for AdamW that is much faster
+            #use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters)
+            #print(f"using fused AdamW: {use_fused}")
+            extra_args = dict() #dict(fused=True) if use_fused else dict()
+            optimizer = opt_func(optim_groups, lr=learning_rate, betas=betas, decouple = True, **extra_args)
+        elif optimizer_name == 'sgd': 
+        # new PyTorch nightly has a new 'fused' option for AdamW that is much faster
+            use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters) 
+            print(f"using fused SGD: {use_fused}")
+            extra_args = dict(fused=True) if use_fused else dict()
+            optimizer = opt_func(optim_groups, lr=learning_rate, **extra_args) 
+
+        elif optimizer_name == 'lamb':
+            use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters)
+            print(f"using fused lamf: {use_fused}")
+            extra_args = dict(fused=True) if use_fused else dict()
+            optimizer = opt_func(optim_groups, lr=learning_rate, betas = betas, decoupled = True, **extra_args)
+        else:
+            raise ValueError('Invalid optimizer.')
         return optimizer
+    
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
         """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """

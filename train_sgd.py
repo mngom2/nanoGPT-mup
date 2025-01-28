@@ -59,7 +59,7 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
-optimizer_name = 'dshampoo'
+optimizer_name = 'sgd'
 init_std = 0.02 # Initialization standard deviation for weights
 # adamw optimizer
 learning_rate = 3e-4 # max learning rate

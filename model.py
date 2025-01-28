@@ -329,11 +329,12 @@ class GPT(nn.Module):
                         decay_params.append(p)
                 else:
                     nodecay_params.append(p)
+        ####################Begin mngom incorporating more optimizers###########################################
             optim_groups = [
                     {"params": mup_decay_params, "weight_decay": weight_decay, 'lr_scale':1 if (optimizer_name == 'sgd') else 1 if optimizer_name == 'dshampoo' else  1/self.config.mup_width_multiplier},
                 {'params': decay_params, 'weight_decay': weight_decay, 'lr_scale': self.config.mup_width_multiplier if (optimizer_name == 'sgd' ) else ((self.config.mup_width_multiplier)**1.5 ) if optimizer_name == 'dshampoo'  else 1},
                     {"params": nodecay_params, "weight_decay": 0.0, 'lr_scale':self.config.mup_width_multiplier if (optimizer_name == 'sgd') else (self.config.mup_width_multiplier)**0.5 if optimizer_name == 'dshampoo' else 1}]
-
+        ####################End mngom incorporating more optimizers###########################################
 
          #   optim_groups = [
          #       {'params': mup_decay_params, 'weight_decay': weight_decay, 'lr_scale': 1/self.config.mup_width_multiplier},
